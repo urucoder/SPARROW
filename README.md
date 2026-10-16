@@ -60,6 +60,11 @@ All services run in **Docker** and are orchestrated with **Docker Compose**. ðŸ
 > from that revision. Jetson-specific fixes made from that point are community
 > maintained and are not included in the current Raspberry Pi release.
 
+> [!TIP]
+> **Older Pis (e.g. Raspberry Pi 3 B+) with just a USB webcam:** use the
+> lightweight [capture-only mode](pi3_capture/README.md). It takes a photo
+> when motion is detected and uploads it to the SPARROW server for processing.
+
 ---
 
 # ðŸš€ Getting Started

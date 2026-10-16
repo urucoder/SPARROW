@@ -1,0 +1,17 @@
+[Unit]
+Description=SPARROW capture-only (USB webcam motion capture + upload)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=sparrow-capture
+Group=sparrow-capture
+SupplementaryGroups=video
+EnvironmentFile=/etc/sparrow-capture/sparrow-capture.env
+ExecStart=/usr/bin/python3 /opt/sparrow-capture/motion_capture.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
