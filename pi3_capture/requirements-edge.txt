@@ -1,0 +1,2 @@
+# CPU wheel only; NumPy and OpenCV come from apt via --system-site-packages.
+onnxruntime==1.31.0

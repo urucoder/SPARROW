@@ -52,6 +52,7 @@ class FakeServer:
 
     def close(self):
         self.httpd.shutdown()
+        self.httpd.server_close()
 
 
 def make_config(tmp, url):

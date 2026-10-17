@@ -1,5 +1,5 @@
 [Unit]
-Description=SPARROW capture-only (USB webcam motion capture + upload)
+Description=SPARROW USB motion capture with optional edge animal detection
 Wants=network-online.target
 After=network-online.target
 
@@ -9,9 +9,12 @@ User=sparrow-capture
 Group=sparrow-capture
 SupplementaryGroups=video
 EnvironmentFile=/etc/sparrow-capture/sparrow-capture.env
-ExecStart=/usr/bin/python3 /opt/sparrow-capture/motion_capture.py
+ExecStart=/opt/sparrow-capture/venv/bin/python /opt/sparrow-capture/motion_capture.py
 Restart=always
 RestartSec=10
+TimeoutStopSec=120
+UMask=0027
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

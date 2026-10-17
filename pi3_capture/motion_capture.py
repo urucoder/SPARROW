@@ -3,16 +3,19 @@
 SPARROW capture-only mode for low-power boards (e.g. Raspberry Pi 3 B+).
 
 Watches a USB webcam, takes a photo whenever motion is detected and uploads it
-to the SPARROW server (POST {SERVER_BASE_URL}/uploads/image), where all AI
-processing happens. No sensors, local models or Docker are required.
+to the SPARROW server (POST {SERVER_BASE_URL}/uploads/image) for storage.
+No server AI inference is triggered by this upload. Optional EDGE_ENABLED
+mode performs local animal detection and best-effort person suppression
+before encoding or queueing. No sensors, PyTorch or Docker are required.
 
-Photos are first written to an on-disk queue so captures are never lost while
-the network is down; a background thread uploads and deletes them.
+Accepted photos are written to a bounded disk queue; a background thread
+retries uploads. Oldest photos can be dropped at the configured size cap.
 """
 
 import hashlib
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -23,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import requests
 
 logger = logging.getLogger("sparrow_capture")
 
@@ -32,6 +36,12 @@ def _env(name, default, cast=str):
         value = os.getenv(name)
         return default if value in (None, "") else cast(value)
     return field(default_factory=factory)
+
+
+def _bool(value):
+    if value.lower() not in ("true", "false", "1", "0"):
+        raise ValueError("Boolean settings must be true/false or 1/0")
+    return value.lower() in ("true", "1")
 
 
 @dataclass
@@ -57,6 +67,38 @@ class Config:
     max_queue_mb: float = _env("MAX_QUEUE_MB", 1024, float)
     upload_timeout: float = _env("UPLOAD_TIMEOUT", 30, float)
     retry_max_seconds: float = _env("RETRY_MAX_SECONDS", 300, float)
+    edge_enabled: bool = _env("EDGE_ENABLED", False, _bool)
+    edge_model_path: str = _env("EDGE_MODEL_PATH", "/opt/sparrow-capture/models/mdv6-yolov10-c.onnx")
+    edge_queue_dir: str = _env("EDGE_QUEUE_DIR", "/var/lib/sparrow-capture/edge-queue")
+    edge_animal_threshold: float = _env("EDGE_ANIMAL_THRESHOLD", 0.5, float)
+    edge_person_threshold: float = _env("EDGE_PERSON_THRESHOLD", 0.2, float)
+    edge_intra_threads: int = _env("EDGE_INTRA_THREADS", 2, int)
+    edge_inter_threads: int = _env("EDGE_INTER_THREADS", 1, int)
+
+    def validate(self):
+        for name in ("capture_width", "capture_height", "detect_width", "motion_frames"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be positive")
+        for name in ("max_queue_mb", "upload_timeout", "retry_max_seconds"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not 1 <= self.jpeg_quality <= 100 or not 0 <= self.pixel_threshold <= 255:
+            raise ValueError("Invalid JPEG quality or motion pixel threshold")
+        if not 0 < self.min_motion_ratio <= self.max_motion_ratio <= 1:
+            raise ValueError("Motion ratios must satisfy 0 < min <= max <= 1")
+        if not 0 < self.background_alpha <= 1:
+            raise ValueError("BACKGROUND_ALPHA must be in (0,1]")
+        if not math.isfinite(self.cooldown_seconds) or self.cooldown_seconds < 0 or self.warmup_frames < 0:
+            raise ValueError("Cooldown and warmup must be nonnegative")
+        if self.edge_enabled:
+            for name in ("edge_animal_threshold", "edge_person_threshold"):
+                if not 0 < getattr(self, name) <= 1:
+                    raise ValueError(f"{name} must be in (0,1]")
+            if not 1 <= self.edge_intra_threads <= 4 or not 1 <= self.edge_inter_threads <= 4:
+                raise ValueError("Edge thread counts must be between 1 and 4")
+            if Path(self.edge_queue_dir).resolve() == Path(self.queue_dir).resolve():
+                raise ValueError("EDGE_QUEUE_DIR must differ from the unchecked capture-only queue")
 
     @property
     def upload_url(self):
@@ -131,27 +173,40 @@ class UploadQueue:
     """Disk-backed queue of JPEG + JSON sidecar pairs, uploaded by a background thread."""
 
     def __init__(self, config, auth_key, unique_id, session=None):
-        import requests
-
         self.config = config
         self.auth_key = auth_key
         self.unique_id = unique_id
         self.session = session or requests.Session()
-        self.dir = Path(config.queue_dir)
+        self.dir = Path(config.edge_queue_dir if config.edge_enabled else config.queue_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread = None
+        self._lock = threading.RLock()
+        self._uploading = None
 
     def enqueue(self, jpeg_bytes, metadata):
+        with self._lock:
+            self._enqueue(jpeg_bytes, metadata)
+
+    def _enqueue(self, jpeg_bytes, metadata):
+        self._validate_edge_metadata(metadata)
         stem = self.dir / Path(metadata["image_name"]).stem
         side_tmp = self.dir / f"{stem.name}.json.tmp"
         img_tmp = self.dir / f"{stem.name}.jpg.tmp"
-        side_tmp.write_text(json.dumps(metadata))
-        img_tmp.write_bytes(jpeg_bytes)
+        for path, data in ((side_tmp, json.dumps(metadata).encode()), (img_tmp, jpeg_bytes)):
+            with path.open("wb") as target:
+                target.write(data)
+                target.flush()
+                os.fsync(target.fileno())
         # Sidecar first: the uploader only picks up *.jpg, whose metadata must already exist.
         os.replace(side_tmp, stem.with_suffix(".json"))
         os.replace(img_tmp, stem.with_suffix(".jpg"))
+        fd = os.open(self.dir, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         self.enforce_size_limit()
         self._wake.set()
 
@@ -159,11 +214,17 @@ class UploadQueue:
         return sorted(self.dir.glob("*.jpg"))
 
     def enforce_size_limit(self):
+        with self._lock:
+            self._enforce_size_limit()
+
+    def _enforce_size_limit(self):
         limit = self.config.max_queue_mb * 1024 * 1024
         files = self.pending()
         total = sum(p.stat().st_size for p in files)
-        while len(files) > 1 and total > limit:
+        while files and total > limit:
             oldest = files.pop(0)
+            if oldest == self._uploading:
+                continue
             total -= oldest.stat().st_size
             logger.warning("Queue over %.0f MB, dropping oldest capture %s", self.config.max_queue_mb, oldest.name)
             self._remove(oldest)
@@ -174,14 +235,22 @@ class UploadQueue:
         jpg.with_suffix(".json").unlink(missing_ok=True)
 
     def upload_one(self, jpg):
+        with self._lock:
+            try:
+                meta = json.loads(jpg.with_suffix(".json").read_text())
+            except (OSError, ValueError):
+                if self.config.edge_enabled:
+                    raise ValueError(f"Missing or corrupt edge metadata: {jpg.name}")
+                logger.warning("Missing/corrupt metadata for %s; using capture-only fallback", jpg.name)
+                meta = {"image_name": jpg.name, "captured_at": "", "detections": []}
+            self._validate_edge_metadata(meta)
+            image = jpg.read_bytes()
+            self._uploading = jpg
+        started = time.monotonic()
         try:
-            meta = json.loads(jpg.with_suffix(".json").read_text())
-        except (OSError, ValueError):
-            meta = {"image_name": jpg.name, "captured_at": "", "detections": []}
-        with open(jpg, "rb") as f:
             response = self.session.post(
                 self.config.upload_url,
-                files={"file": (jpg.name, f, "image/jpeg")},
+                files={"file": (jpg.name, image, "image/jpeg")},
                 data={
                     "auth_key": self.auth_key,
                     "unique_id": self.unique_id,
@@ -189,9 +258,39 @@ class UploadQueue:
                 },
                 timeout=self.config.upload_timeout,
             )
-        response.raise_for_status()
-        self._remove(jpg)
-        logger.info("Uploaded %s", jpg.name)
+            response.raise_for_status()
+            with self._lock:
+                self._remove(jpg)
+            logger.info("Uploaded %s in %.3fs", jpg.name, time.monotonic() - started)
+        finally:
+            with self._lock:
+                self._uploading = None
+
+    def _validate_edge_metadata(self, meta):
+        if not self.config.edge_enabled:
+            return
+        from edge_inference import MODEL_ID, MODEL_SHA256
+
+        if not isinstance(meta, dict):
+            raise ValueError("Invalid edge metadata object")
+        policy = meta.get("edge_policy", {})
+        detections = meta.get("detections", [])
+        if (not isinstance(policy, dict) or policy.get("model") != MODEL_ID
+                or policy.get("sha256") != MODEL_SHA256
+                or policy.get("person_checked") is not True
+                or not isinstance(detections, list) or not detections):
+            raise ValueError("Refusing unchecked or invalid image in edge queue")
+        for detection in detections:
+            if not isinstance(detection, dict):
+                raise ValueError("Invalid edge detection")
+            score = detection.get("confidence")
+            box = detection.get("bbox")
+            if (detection.get("label") != "animal" or detection.get("class_id") != 0
+                    or not isinstance(score, (float, int)) or not 0 < score <= 1
+                    or not isinstance(box, list) or len(box) != 4
+                    or any(type(v) is not int or v < 0 for v in box)
+                    or box[2] <= box[0] or box[3] <= box[1]):
+                raise ValueError("Invalid edge animal score or pixel box")
 
     def drain(self):
         """Upload everything currently queued, oldest first. Returns True if nothing failed."""
@@ -202,21 +301,22 @@ class UploadQueue:
                 self.upload_one(jpg)
             except FileNotFoundError:
                 continue  # pruned by enforce_size_limit meanwhile
-            except Exception as e:
+            except (requests.RequestException, OSError, ValueError) as e:
                 logger.warning("Upload of %s failed: %s", jpg.name, e)
                 return False
         return True
 
     def _run(self):
-        backoff = 5.0
+        backoff = min(5.0, self.config.retry_max_seconds)
         while not self._stop.is_set():
+            self._wake.clear()
             if self.drain():
-                backoff = 5.0
+                backoff = min(5.0, self.config.retry_max_seconds)
                 self._wake.wait(timeout=60)
             else:
-                self._wake.wait(timeout=backoff)
+                # New captures must not defeat retry backoff during an outage.
+                self._stop.wait(timeout=backoff)
                 backoff = min(backoff * 2, self.config.retry_max_seconds)
-            self._wake.clear()
 
     def start(self):
         self._thread = threading.Thread(target=self._run, name="uploader", daemon=True)
@@ -226,7 +326,8 @@ class UploadQueue:
         self._stop.set()
         self._wake.set()
         if self._thread:
-            self._thread.join(timeout=10)
+            self._thread.join()
+        self.session.close()
 
 
 def open_camera(config):
@@ -254,9 +355,16 @@ def to_detect_frame(frame, detect_width):
     return cv2.GaussianBlur(gray, (5, 5), 0)
 
 
-def run(config, stop_event, camera_factory=open_camera):
+def run(config, stop_event, camera_factory=open_camera, edge_factory=None):
     import cv2
 
+    config.validate()
+    edge = None
+    if config.edge_enabled:
+        from edge_inference import EdgeDetector
+
+        edge = (edge_factory or EdgeDetector)(config)
+        logger.info("Edge mode enabled: %s", edge.metadata())
     auth_key = Path(config.access_key_file).read_text(encoding="utf-8").strip()
     if not auth_key:
         raise ValueError(f"Access key file {config.access_key_file} is empty")
@@ -271,6 +379,7 @@ def run(config, stop_event, camera_factory=open_camera):
     )
     hostname = socket.gethostname()
     last_capture = 0.0
+    inference_backoff = 1.0
     cap = None
     try:
         while not stop_event.is_set():
@@ -279,7 +388,7 @@ def run(config, stop_event, camera_factory=open_camera):
                     cap = camera_factory(config)
                     detector.reset()
                     logger.info("Camera %s opened", config.camera_device)
-                except Exception as e:
+                except (RuntimeError, OSError, cv2.error) as e:
                     logger.error("%s; retrying in 10 s", e)
                     stop_event.wait(10)
                     continue
@@ -299,21 +408,44 @@ def run(config, stop_event, camera_factory=open_camera):
 
             last_capture = now
             captured_at = datetime.now(timezone.utc)
+            detections = []
+            if edge is not None:
+                started = time.monotonic()
+                try:
+                    detections, reason = edge.detect(frame)
+                except (RuntimeError, ValueError, cv2.error) as exc:
+                    logger.error("Edge inference failed; frame discarded; retry in %.1fs: %s",
+                                 inference_backoff, exc)
+                    stop_event.wait(inference_backoff)
+                    inference_backoff = min(inference_backoff * 2, 60)
+                    continue
+                inference_backoff = 1.0
+                logger.info("Edge decision=%s inference=%.3fs detections=%d",
+                            reason, time.monotonic() - started, len(detections))
+                if stop_event.is_set():
+                    break
+                if not detections:
+                    continue
             name = f"{unique_id}_{captured_at.strftime('%Y%m%dT%H%M%S_%f')}.jpg"
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, config.jpeg_quality])
             if not ok:
                 logger.error("JPEG encoding failed")
                 continue
-            queue.enqueue(buf.tobytes(), {
+            meta = {
                 "image_name": name,
                 "captured_at": captured_at.isoformat(),
-                "detections": [],
+                "detections": detections,
                 "source": "pi3_capture",
                 "trigger": "motion",
                 "motion_ratio": round(detector.last_ratio, 4),
                 "hostname": hostname,
-            })
-            logger.info("Motion (%.1f%% of frame) -> captured %s", detector.last_ratio * 100, name)
+            }
+            if edge is not None:
+                meta["edge_policy"] = edge.metadata()
+                meta["image_width"], meta["image_height"] = frame.shape[1], frame.shape[0]
+            queue.enqueue(buf.tobytes(), meta)
+            logger.info("Motion (%.1f%% of frame) -> captured %s event_to_queue=%.3fs queue_depth=%d",
+                        detector.last_ratio * 100, name, time.monotonic() - now, len(queue.pending()))
     finally:
         if cap is not None:
             cap.release()

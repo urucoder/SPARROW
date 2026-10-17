@@ -62,8 +62,9 @@ All services run in **Docker** and are orchestrated with **Docker Compose**. ðŸ
 
 > [!TIP]
 > **Older Pis (e.g. Raspberry Pi 3 B+) with just a USB webcam:** use the
-> lightweight [capture-only mode](pi3_capture/README.md). It takes a photo
-> when motion is detected and uploads it to the SPARROW server for processing.
+> lightweight [USB camera service](pi3_capture/README.md). It supports
+> capture-only uploads or optional local animal detection with person-image
+> suppression and bounding boxes. Empty detections do not trigger server inference.
 
 ---
 
