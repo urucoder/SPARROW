@@ -245,8 +245,13 @@ starting threshold; the full animal scene was accepted. No thresholds were
 weakened to force acceptance. This illustrates why both privacy misses and
 false rejections need scene-specific evaluation.
 
-The authenticated gallery overlay remains **unverified** because the browser
-was at the login page. The root installer/service-user permissions, boot
+Gallery overlay data was verified without logging in. The dashboard's own
+`api_image_boxes` function, run inside the dashboard container, returned the
+uploaded original-image pixel boxes (`label: "animal"`). The stored gallery
+JPEGs keep the original resolution (451x300 fixture, 1280x720 camera), and
+redrawing them with the gallery's cover-scale overlay math aligned the boxes
+with the subject. An authenticated in-browser check is still pending a
+dashboard login. The root installer/service-user permissions, boot
 startup and reboot recovery also remain **unverified** pending user-assisted
 sudo and coordinated service installation. The test service was not installed
 or enabled, and the existing dashboard/API/database were not recreated.
